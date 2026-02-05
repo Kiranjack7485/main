@@ -1,104 +1,81 @@
 import json
 import asyncio
 import websockets
-import time
-from datetime import datetime, time as dtime
+from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
-from config import (
-    SYMBOLS,
-    MIN_SCORE,
-    ALERT_COOLDOWN,
-    TRADE_START_HOUR,
-    TRADE_START_MIN,
-    TRADE_END_HOUR,
-    TRADE_END_MIN
-)
-
+from config import SYMBOLS, MIN_SCORE
 from market_data import store_candle, get_candles
 from indicators import compute_indicators
 from scoring import score_signal
+from risk import calculate_risk
 from telegram import send_alert
 
-BINANCE_WS = "wss://stream.binance.com:9443/stream?streams="
-streams = "/".join([f"{s.lower()}@kline_1m" for s in SYMBOLS])
+BYBIT_WS = "wss://stream.bybit.com/v5/public/linear"
 
-last_alert_time = {}
 IST = ZoneInfo("Asia/Kolkata")
 
-
-def is_within_trading_window():
+def trading_time_allowed():
     now = datetime.now(IST).time()
-
-    start = dtime(TRADE_START_HOUR, TRADE_START_MIN)
-    end = dtime(TRADE_END_HOUR, TRADE_END_MIN)
-
-    return start <= now <= end
-
-
-def risk_engine(signal):
-    entry = signal["price"]
-    sl = round(entry * 0.997, 4)
-    tp = round(entry * 1.006, 4)
-
-    return {
-        "entry": entry,
-        "stop_loss": sl,
-        "target": tp,
-        "leverage": "5x–8x",
-        "reason": "US session liquidity + strong momentum + volume confirmation"
-    }
-
+    return time(17, 30) <= now <= time(23, 30)
 
 async def run():
-    async with websockets.connect(BINANCE_WS + streams) as ws:
-        print("🟢 Connected to Binance WebSocket")
+    async with websockets.connect(BYBIT_WS) as ws:
+        print("🟢 Connected to Bybit WebSocket")
+
+        # Subscribe to all symbols
+        args = [f"kline.1.{s}" for s in SYMBOLS]
+        await ws.send(json.dumps({
+            "op": "subscribe",
+            "args": args
+        }))
 
         while True:
             msg = json.loads(await ws.recv())
-            k = msg["data"]["k"]
 
-            if not k["x"]:
+            if "topic" not in msg or "data" not in msg:
                 continue
 
-            symbol = k["s"]
-            now_ts = time.time()
+            topic = msg["topic"]
+            symbol = topic.split(".")[-1]
+
+            k = msg["data"][0]
+
+            # Only closed candles
+            if not k["confirm"]:
+                continue
 
             candle = {
-                "open": float(k["o"]),
-                "high": float(k["h"]),
-                "low": float(k["l"]),
-                "close": float(k["c"]),
-                "volume": float(k["v"]),
-                "close_time": k["T"]
+                "open": float(k["open"]),
+                "high": float(k["high"]),
+                "low": float(k["low"]),
+                "close": float(k["close"]),
+                "volume": float(k["volume"]),
+                "close_time": int(k["timestamp"])
             }
+
+            print(f"🕯 {symbol} closed @ {candle['close']}")
 
             store_candle(symbol, candle)
             candles = get_candles(symbol)
 
-            ind = compute_indicators(candles)
-            if not ind:
+            indicators = compute_indicators(candles)
+            if not indicators:
                 continue
 
-            signal = score_signal(symbol, ind)
-            if not signal or signal["score"] < MIN_SCORE:
-                continue
+            signal = score_signal(symbol, indicators)
 
-            # ⏰ TIME FILTER (IMPORTANT)
-            if not is_within_trading_window():
-                print(f"⏳ Signal ignored (outside IST window): {symbol}")
-                continue
+            print(
+                f"📊 {symbol} | Score: {signal['score']} | Trend: {signal['trend']}"
+            )
 
-            # ⛔ Cooldown check
-            if symbol in last_alert_time:
-                if now_ts - last_alert_time[symbol] < ALERT_COOLDOWN * 60:
-                    continue
-
-            risk = risk_engine(signal)
-            send_alert(signal, risk)
-
-            last_alert_time[symbol] = now_ts
-            print(f"🚨 ALERT SENT → {symbol} | Score {signal['score']}")
-
+            # 🔒 STRICT + TIME FILTER
+            if (
+                signal["score"] >= MIN_SCORE
+                and trading_time_allowed()
+                and "STRONG" in signal["trend"]
+            ):
+                risk = calculate_risk(signal)
+                await send_alert(signal, risk)
 
 asyncio.run(run())
