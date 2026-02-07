@@ -1,3 +1,4 @@
+print("✅ risk.py loaded – version 2026-02-06-01")
 def calculate_risk(signal):
     price = float(signal["price"])
     trend = signal.get("trend", "")
